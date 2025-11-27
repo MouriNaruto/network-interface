@@ -8,19 +8,44 @@ use std::iter::Iterator;
 use std::marker::PhantomData;
 
 use libc::{free, malloc, wchar_t, wcslen};
-use winapi::{
-    ctypes::c_ulong,
-    shared::{
-        ws2def::{AF_UNSPEC, SOCKADDR_IN},
-        ws2ipdef::SOCKADDR_IN6,
-        netioapi::{ConvertLengthToIpv4Mask, ConvertInterfaceLuidToIndex},
-        ntdef::ULONG,
-        ifdef::IF_LUID,
-        winerror,
+use windows::Win32::{
+    Foundation::{
+        ERROR_BUFFER_OVERFLOW,
+        ERROR_SUCCESS,
+        WIN32_ERROR,
     },
-    um::{
-        iptypes::{IP_ADAPTER_ADDRESSES, IP_ADAPTER_UNICAST_ADDRESS, IP_ADAPTER_PREFIX},
-        iphlpapi::{GetAdaptersAddresses},
+    Networking::WinSock::{
+        AF_INET,
+        AF_INET6,
+        AF_UNSPEC,
+        SOCKADDR_IN,
+        SOCKADDR_IN6,
+    },
+    NetworkManagement::IpHelper::{
+        GAA_FLAG_INCLUDE_PREFIX,
+        IF_TYPE_OTHER,
+        IF_TYPE_ETHERNET_CSMACD,
+        IF_TYPE_IEEE1394,
+        IF_TYPE_PPP,
+        IF_TYPE_TUNNEL,
+        IF_TYPE_IEEE80211,
+        IF_TYPE_SOFTWARE_LOOPBACK,
+        IP_ADAPTER_ADDRESSES_LH,
+        IP_ADAPTER_PREFIX_XP,
+        IP_ADAPTER_UNICAST_ADDRESS_LH,
+        ConvertInterfaceLuidToIndex,
+        ConvertLengthToIpv4Mask,
+        GetAdaptersAddresses,
+    },
+    NetworkManagement::Ndis::{
+        NET_LUID_LH,
+        IfOperStatusUp,
+        IfOperStatusDown,
+        IfOperStatusTesting,
+        IfOperStatusUnknown,
+        IfOperStatusDormant,
+        IfOperStatusNotPresent,
+        IfOperStatusLowerLayerDown,
     },
 };
 
@@ -28,24 +53,6 @@ use crate::utils::hex::HexSlice;
 use crate::utils::ffialloc::FFIAlloc;
 use crate::{IFF_ETH, IFF_WIRELESS, IFF_TUN,IFF_LOOPBACK, Addr, Error, NetworkInterface, Status, NetworkInterfaceConfig, Result, V4IfAddr, V6IfAddr};
 use crate::interface::Netmask;
-
-/// An alias for `IP_ADAPTER_ADDRESSES`
-type AdapterAddress = IP_ADAPTER_ADDRESSES;
-
-/// A constant to store `winapi::shared::ws2def::AF_INET` casted as `u16`
-const AF_INET: u16 = winapi::shared::ws2def::AF_INET as u16;
-
-/// A constant to store ` winapi::shared::ws2def::AF_INET6` casted as `u16`
-const AF_INET6: u16 = winapi::shared::ws2def::AF_INET6 as u16;
-
-/// The address family of the addresses to retrieve. This parameter must be one of the following values.
-/// The default address family is `AF_UNSPECT` in order to gather both IPv4 and IPv6 network interfaces.
-///
-/// Source: https://docs.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getadaptersaddresses#parameters
-const GET_ADAPTERS_ADDRESSES_FAMILY: u32 = AF_UNSPEC as u32;
-
-/// A constant to store `winapi::um::iptypes::GAA_FLAG_INCLUDE_PREFIX`
-const GET_ADAPTERS_ADDRESSES_FLAGS: ULONG = winapi::um::iptypes::GAA_FLAG_INCLUDE_PREFIX;
 
 type MacAddress = Option<String>;
 
@@ -62,9 +69,9 @@ macro_rules! iterable_raw_pointer {
     };
 }
 
-iterable_raw_pointer!(IP_ADAPTER_ADDRESSES, Next);
-iterable_raw_pointer!(IP_ADAPTER_UNICAST_ADDRESS, Next);
-iterable_raw_pointer!(IP_ADAPTER_PREFIX, Next);
+iterable_raw_pointer!(IP_ADAPTER_ADDRESSES_LH, Next);
+iterable_raw_pointer!(IP_ADAPTER_PREFIX_XP, Next);
+iterable_raw_pointer!(IP_ADAPTER_UNICAST_ADDRESS_LH, Next);
 
 impl NetworkInterfaceConfig for NetworkInterface {
     fn filter(netifs: Vec<NetworkInterface>, flags: i32) -> Result<Vec<NetworkInterface>> {
@@ -83,25 +90,25 @@ impl NetworkInterfaceConfig for NetworkInterface {
         let mut try_no = 1;
 
         let adapter_address = loop {
-            let adapter_address = FFIAlloc::alloc(buffer_size as usize).ok_or_else(|| {
+            let adapter_address = FFIAlloc::<IP_ADAPTER_ADDRESSES_LH>::alloc(buffer_size as usize).ok_or_else(|| {
                 // Memory allocation failed for IP_ADAPTER_ADDRESSES struct
                 Error::GetIfAddrsError(String::from("GetAdaptersAddresses"), 1)
             })?;
 
-            let res = unsafe {
+            let res = WIN32_ERROR(unsafe {
                 GetAdaptersAddresses(
-                    GET_ADAPTERS_ADDRESSES_FAMILY,
-                    GET_ADAPTERS_ADDRESSES_FLAGS,
-                    null_mut(),
-                    adapter_address.as_mut_ptr(),
+                    AF_UNSPEC.0 as u32,
+                    GAA_FLAG_INCLUDE_PREFIX,
+                    None,
+                    Some(adapter_address.as_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
                     &mut buffer_size,
                 )
-            };
+            });
             match res {
-                winerror::ERROR_SUCCESS => {
+                ERROR_SUCCESS => {
                     break Ok(adapter_address);
                 }
-                winerror::ERROR_BUFFER_OVERFLOW => {
+                ERROR_BUFFER_OVERFLOW => {
                     // The buffer size indicated by the `SizePointer` parameter is too small to hold the
                     // adapter information or the `AdapterAddresses` parameter is `NULL`. The `SizePointer`
                     // parameter returned points to the required size of the buffer to hold the adapter
@@ -111,7 +118,7 @@ impl NetworkInterfaceConfig for NetworkInterface {
                     if try_no == MAX_TRIES {
                         break Err(Error::GetIfAddrsError(
                             "GetAdapterAddresses: alloc error".to_string(),
-                            res as i32,
+                            res.0 as i32,
                         ));
                     }
                     try_no += 1;
@@ -119,7 +126,7 @@ impl NetworkInterfaceConfig for NetworkInterface {
                 _ => {
                     break Err(Error::GetIfAddrsError(
                         "GetAdapterAddresses".to_string(),
-                        res as i32,
+                        res.0 as i32,
                     ));
                 }
             }
@@ -138,7 +145,7 @@ impl NetworkInterfaceConfig for NetworkInterface {
                 addr: Vec::new(),
                 mac_addr,
                 index,
-                status: status, flags: 0,
+                status: status, flags: get_adapter_flags(adapter_address),
             };
 
             for current_unicast_address in
@@ -194,7 +201,7 @@ impl NetworkInterfaceConfig for NetworkInterface {
 // be the same, so we search for the unicast address in the prefix list, and
 // then the broadcast address is next in list.
 fn lookup_ipv4_broadcast_addr(
-    adapter_address: &IP_ADAPTER_ADDRESSES,
+    adapter_address: &IP_ADAPTER_ADDRESSES_LH,
     unicast_ip: &SOCKADDR_IN,
 ) -> Option<Ipv4Addr> {
     let mut prefix_index_v4 = 0;
@@ -221,26 +228,23 @@ fn lookup_ipv4_broadcast_addr(
 }
 
 /// Retrieves the network interface name
-fn make_adapter_address_name(adapter_address: &AdapterAddress) -> Result<String> {
-    let address_name = adapter_address.FriendlyName;
-    let address_name_length = unsafe { wcslen(address_name as *const wchar_t) };
-    let byte_slice = unsafe { from_raw_parts(address_name, address_name_length) };
-    let string = String::from_utf16(byte_slice).map_err(Error::from)?;
-
-    Ok(string)
+fn make_adapter_address_name(adapter_address: &IP_ADAPTER_ADDRESSES_LH) -> Result<String> {
+    Ok(unsafe {
+        adapter_address.FriendlyName.to_string().map_err(Error::from)
+    }?)
 }
 
 /// Creates a `Ipv6Addr` from a `SOCKADDR_IN6`
 fn make_ipv6_addr(sockaddr: &SOCKADDR_IN6) -> Result<Ipv6Addr> {
-    let address_bytes = unsafe { sockaddr.sin6_addr.u.Byte() };
-    let ip = Ipv6Addr::from(*address_bytes);
+    let address_bytes = unsafe { sockaddr.sin6_addr.u.Byte };
+    let ip = Ipv6Addr::from(address_bytes);
 
     Ok(ip)
 }
 
 /// Creates a `Ipv4Addr` from a `SOCKADDR_IN`
 fn make_ipv4_addr(sockaddr: &SOCKADDR_IN) -> Ipv4Addr {
-    let address = unsafe { sockaddr.sin_addr.S_un.S_addr() };
+    let address = unsafe { sockaddr.sin_addr.S_un.S_addr };
 
     if cfg!(target_endian = "little") {
         // due to a difference on how bytes are arranged on a
@@ -251,13 +255,13 @@ fn make_ipv4_addr(sockaddr: &SOCKADDR_IN) -> Ipv4Addr {
         return Ipv4Addr::from(address.swap_bytes());
     }
 
-    Ipv4Addr::from(*address)
+    Ipv4Addr::from(address)
 }
 
 /// Compare 2 ipv4 addresses.
 fn ipv4_addr_equal(sockaddr1: &SOCKADDR_IN, sockaddr2: &SOCKADDR_IN) -> bool {
-    let address1 = unsafe { sockaddr1.sin_addr.S_un.S_addr() };
-    let address2 = unsafe { sockaddr2.sin_addr.S_un.S_addr() };
+    let address1 = unsafe { sockaddr1.sin_addr.S_un.S_addr };
+    let address2 = unsafe { sockaddr2.sin_addr.S_un.S_addr };
     address1 == address2
 }
 
@@ -266,11 +270,11 @@ fn ipv4_addr_equal(sockaddr1: &SOCKADDR_IN, sockaddr2: &SOCKADDR_IN) -> bool {
 ///
 /// An implementation of `GetIpAddrTable` to get all available network interfaces would be required
 /// in order to support previous versions of Windows.
-fn make_ipv4_netmask(unicast_address: &IP_ADAPTER_UNICAST_ADDRESS) -> Netmask<Ipv4Addr> {
-    let mut mask: c_ulong = 0;
+fn make_ipv4_netmask(unicast_address: &IP_ADAPTER_UNICAST_ADDRESS_LH) -> Netmask<Ipv4Addr> {
+    let mut mask: u32 = 0;
     let on_link_prefix_length = unicast_address.OnLinkPrefixLength;
     unsafe {
-        ConvertLengthToIpv4Mask(on_link_prefix_length as u32, &mut mask as *mut c_ulong);
+        ConvertLengthToIpv4Mask(on_link_prefix_length as u32, &mut mask as *mut u32);
     }
 
     if cfg!(target_endian = "little") {
@@ -290,7 +294,7 @@ fn make_ipv6_netmask(_sockaddr: &SOCKADDR_IN6) -> Netmask<Ipv6Addr> {
 }
 
 /// Creates MacAddress from AdapterAddress
-fn make_mac_address(adapter_address: &AdapterAddress) -> MacAddress {
+fn make_mac_address(adapter_address: &IP_ADAPTER_ADDRESSES_LH) -> MacAddress {
     // see https://docs.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getadaptersaddresses#examples
     let mac_addr_len = adapter_address.PhysicalAddressLength as usize;
     match mac_addr_len {
@@ -302,39 +306,40 @@ fn make_mac_address(adapter_address: &AdapterAddress) -> MacAddress {
     }
 }
 
-fn get_adapter_address_index(adapter_address: &AdapterAddress) -> Result<u32> {
-    let adapter_luid = &adapter_address.Luid as *const IF_LUID;
+fn get_adapter_address_index(adapter_address: &IP_ADAPTER_ADDRESSES_LH) -> Result<u32> {
+    let adapter_luid = &adapter_address.Luid;
 
     let index = &mut 0u32 as *mut u32;
 
     match unsafe { ConvertInterfaceLuidToIndex(adapter_luid, index) } {
-        0 => Ok(unsafe { *index }),
+        ERROR_SUCCESS => Ok(unsafe { *index }),
         e => Err(crate::error::Error::GetIfNameError(
             "ConvertInterfaceLuidToIndex".to_string(),
-            e,
+            e.0,
         )),
     }
 }
+
 /// Get interface status 
 /// 
 /// reference https://learn.microsoft.com/en-us/windows/win32/api/iptypes/ns-iptypes-ip_adapter_addresses_lh
 /// 
-fn get_adapter_operstatus(adapter_address: &AdapterAddress) -> Status {
+fn get_adapter_operstatus(adapter_address: &IP_ADAPTER_ADDRESSES_LH) -> Status {
     match adapter_address.OperStatus {
-        1 => Status::Up,
-        2 => Status::Down,
-        3 | 4 | 5 | 6 |7  => Status::Unavailable,
+        IfOperStatusUp => Status::Up,
+        IfOperStatusDown => Status::Down,
+        IfOperStatusTesting | IfOperStatusUnknown | IfOperStatusDormant | IfOperStatusNotPresent | IfOperStatusLowerLayerDown => Status::Unavailable,
         _ => Status::Unknown,
     }
 }
 /// map interface type to libc flags
 /// reference https://learn.microsoft.com/en-us/windows/win32/api/iptypes/ns-iptypes-ip_adapter_addresses_lh
-fn get_adapter_flags(adapter_address: &AdapterAddress) -> i32 {
+fn get_adapter_flags(adapter_address: &IP_ADAPTER_ADDRESSES_LH) -> i32 {
     match adapter_address.IfType {
-        1 | 6 | 144 => IFF_ETH,
-        23 | 131 => IFF_TUN,
-        71 => IFF_WIRELESS,
-        24 => IFF_LOOPBACK,
+        IF_TYPE_OTHER | IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE1394 => IFF_ETH,
+        IF_TYPE_PPP | IF_TYPE_TUNNEL => IFF_TUN,
+        IF_TYPE_IEEE80211 => IFF_WIRELESS,
+        IF_TYPE_SOFTWARE_LOOPBACK => IFF_LOOPBACK,
         _ => 0,
     }
 }
